@@ -61,7 +61,7 @@ impl<'a> Default for Block<'a> {
             title: None,
             borders: Borders::NONE,
             border_style: Default::default(),
-            border_type: BorderType::Plain,
+            border_type: BorderType::Rounded,
             style: Default::default(),
         }
     }

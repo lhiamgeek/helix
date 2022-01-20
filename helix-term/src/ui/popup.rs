@@ -3,7 +3,10 @@ use crate::{
     ctrl, key,
 };
 use crossterm::event::Event;
-use tui::buffer::Buffer as Surface;
+use tui::{
+    buffer::Buffer as Surface,
+    widgets::{Block, Borders, Widget},
+};
 
 use helix_core::Position;
 use helix_view::graphics::{Margin, Rect};
@@ -182,14 +185,21 @@ impl<T: Component> Component for Popup<T> {
         let (rel_x, rel_y) = self.get_rel_position(viewport, cx);
 
         // clip to viewport
-        let area = viewport.intersection(Rect::new(rel_x, rel_y, self.size.0, self.size.1));
+        let area = viewport.intersection(Rect::new(rel_x, rel_y, self.size.0+2, self.size.1+2));
+        let margin = Margin {
+            vertical: 1,
+            horizontal: 1,
+        };
+        let inner = area.inner(&margin);
 
         // clear area
         let background = cx.editor.theme.get("ui.popup");
         surface.clear_with(area, background);
 
-        let inner = area.inner(&self.margin);
         self.contents.render(inner, surface, cx);
+
+        let block = Block::default().borders(Borders::ALL);
+        block.render(area, surface);
     }
 
     fn id(&self) -> Option<&'static str> {

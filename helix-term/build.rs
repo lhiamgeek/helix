@@ -3,6 +3,10 @@ use std::borrow::Cow;
 use std::process::Command;
 
 fn main() {
+    let version = "custom rounded-corners";
+
+    println!("cargo:rustc-env=VERSION_AND_GIT_HASH={}", version);
+    return;
     let git_hash = Command::new("git")
         .args(&["rev-parse", "HEAD"])
         .output()

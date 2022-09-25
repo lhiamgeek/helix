@@ -286,19 +286,27 @@ impl MappableCommand {
         goto_type_definition, "Goto type definition",
         goto_implementation, "Goto implementation",
         goto_file_start, "Goto line number <n> else file start",
+        extend_to_file_start, "Extend to line number <n> else file start",
         goto_file_end, "Goto file end",
+        extend_to_file_end, "Extend to file end",
         goto_file, "Goto files in selection",
         goto_file_hsplit, "Goto files in selection (hsplit)",
         goto_file_vsplit, "Goto files in selection (vsplit)",
         goto_reference, "Goto references",
         goto_window_top, "Goto window top",
+        extend_to_window_top, "Extend to window top",
         goto_window_center, "Goto window center",
+        extend_to_window_center, "Extend to window center",
         goto_window_bottom, "Goto window bottom",
+        extend_to_window_bottom, "Extend to window bottom",
         goto_last_accessed_file, "Goto last accessed file",
         goto_last_modified_file, "Goto last modified file",
         goto_last_modification, "Goto last modification",
+        extend_to_last_modification, "Extend to last modification",
         goto_line, "Goto line",
+        extend_to_line, "Extend to line",
         goto_last_line, "Goto last line",
+        extend_to_last_line, "Extend to last line",
         goto_first_diag, "Goto first diagnostic",
         goto_last_diag, "Goto last diagnostic",
         goto_next_diag, "Goto next diagnostic",
@@ -310,6 +318,7 @@ impl MappableCommand {
         // TODO: different description ?
         goto_line_end_newline, "Goto line end",
         goto_first_nonwhitespace, "Goto first non-blank in line",
+        extend_to_first_nonwhitespace, "Extend to first non-blank in line",
         trim_selections, "Trim whitespace from selections",
         extend_to_line_start, "Extend to line start",
         extend_to_line_end, "Extend to line end",
@@ -583,15 +592,7 @@ fn goto_line_end_impl(view: &mut View, doc: &mut Document, movement: Movement) {
 
 fn goto_line_end(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    goto_line_end_impl(
-        view,
-        doc,
-        if cx.editor.mode == Mode::Select {
-            Movement::Extend
-        } else {
-            Movement::Move
-        },
-    )
+    goto_line_end_impl(view, doc, movement_from_mode(cx.editor.mode))
 }
 
 fn extend_to_line_end(cx: &mut Context) {
@@ -644,15 +645,7 @@ fn goto_line_start_impl(view: &mut View, doc: &mut Document, movement: Movement)
 
 fn goto_line_start(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    goto_line_start_impl(
-        view,
-        doc,
-        if cx.editor.mode == Mode::Select {
-            Movement::Extend
-        } else {
-            Movement::Move
-        },
-    )
+    goto_line_start_impl(view, doc, movement_from_mode(cx.editor.mode))
 }
 
 fn goto_next_buffer(cx: &mut Context) {
@@ -744,6 +737,14 @@ fn kill_to_line_end(cx: &mut Context) {
 }
 
 fn goto_first_nonwhitespace(cx: &mut Context) {
+    goto_first_nonwhitespace_impl(cx, movement_from_mode(cx.editor.mode))
+}
+
+fn extend_to_first_nonwhitespace(cx: &mut Context) {
+    goto_first_nonwhitespace_impl(cx, Movement::Extend)
+}
+
+fn goto_first_nonwhitespace_impl(cx: &mut Context, movement: Movement) {
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
 
@@ -752,7 +753,7 @@ fn goto_first_nonwhitespace(cx: &mut Context) {
 
         if let Some(pos) = find_first_non_whitespace_char(text.line(line)) {
             let pos = pos + text.line_to_char(line);
-            range.put_cursor(text, pos, cx.editor.mode == Mode::Select)
+            range.put_cursor(text, pos, movement == Movement::Extend)
         } else {
             range
         }
@@ -861,7 +862,7 @@ fn align_selections(cx: &mut Context) {
     doc.apply(&transaction, view.id);
 }
 
-fn goto_window(cx: &mut Context, align: Align) {
+fn goto_window(cx: &mut Context, align: Align, movement: Movement) {
     let count = cx.count() - 1;
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
@@ -886,19 +887,37 @@ fn goto_window(cx: &mut Context, align: Align) {
 
     let pos = doc.text().line_to_char(line);
 
-    doc.set_selection(view.id, Selection::point(pos));
+    let text = doc.text().slice(..);
+    let selection = doc
+        .selection(view.id)
+        .clone()
+        .transform(|range| range.put_cursor(text, pos, movement == Movement::Extend));
+    push_jump(view, doc);
+    doc.set_selection(view.id, selection);
 }
 
 fn goto_window_top(cx: &mut Context) {
-    goto_window(cx, Align::Top)
+    goto_window(cx, Align::Top, movement_from_mode(cx.editor.mode))
 }
 
 fn goto_window_center(cx: &mut Context) {
-    goto_window(cx, Align::Center)
+    goto_window(cx, Align::Center, movement_from_mode(cx.editor.mode))
 }
 
 fn goto_window_bottom(cx: &mut Context) {
-    goto_window(cx, Align::Bottom)
+    goto_window(cx, Align::Bottom, movement_from_mode(cx.editor.mode))
+}
+
+fn extend_to_window_top(cx: &mut Context) {
+    goto_window(cx, Align::Top, Movement::Extend)
+}
+
+fn extend_to_window_center(cx: &mut Context) {
+    goto_window(cx, Align::Center, Movement::Extend)
+}
+
+fn extend_to_window_bottom(cx: &mut Context) {
+    goto_window(cx, Align::Bottom, Movement::Extend)
 }
 
 fn move_word_impl<F>(cx: &mut Context, move_fn: F)
@@ -977,6 +996,14 @@ fn goto_next_paragraph(cx: &mut Context) {
 }
 
 fn goto_file_start(cx: &mut Context) {
+    goto_file_start_impl(cx, movement_from_mode(cx.editor.mode));
+}
+
+fn extend_to_file_start(cx: &mut Context) {
+    goto_file_start_impl(cx, Movement::Extend);
+}
+
+fn goto_file_start_impl(cx: &mut Context, movement: Movement) {
     if cx.count.is_some() {
         goto_line(cx);
     } else {
@@ -985,20 +1012,28 @@ fn goto_file_start(cx: &mut Context) {
         let selection = doc
             .selection(view.id)
             .clone()
-            .transform(|range| range.put_cursor(text, 0, cx.editor.mode == Mode::Select));
+            .transform(|range| range.put_cursor(text, 0, movement == Movement::Extend));
         push_jump(view, doc);
         doc.set_selection(view.id, selection);
     }
 }
 
 fn goto_file_end(cx: &mut Context) {
+    goto_file_end_impl(cx, movement_from_mode(cx.editor.mode));
+}
+
+fn extend_to_file_end(cx: &mut Context) {
+    goto_file_end_impl(cx, Movement::Extend);
+}
+
+fn goto_file_end_impl(cx: &mut Context, movement: Movement) {
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
     let pos = doc.text().len_chars();
     let selection = doc
         .selection(view.id)
         .clone()
-        .transform(|range| range.put_cursor(text, pos, cx.editor.mode == Mode::Select));
+        .transform(|range| range.put_cursor(text, pos, movement == Movement::Extend));
     push_jump(view, doc);
     doc.set_selection(view.id, selection);
 }
@@ -2677,11 +2712,23 @@ fn push_jump(view: &mut View, doc: &Document) {
     view.jumps.push(jump);
 }
 
-fn goto_line(cx: &mut Context) {
-    goto_line_impl(cx.editor, cx.count)
+fn movement_from_mode(mode: Mode) -> Movement {
+    if mode == Mode::Select {
+        Movement::Extend
+    } else {
+        Movement::Move
+    }
 }
 
-fn goto_line_impl(editor: &mut Editor, count: Option<NonZeroUsize>) {
+fn goto_line(cx: &mut Context) {
+    goto_line_impl(cx.editor, cx.count, movement_from_mode(cx.editor.mode))
+}
+
+fn extend_to_line(cx: &mut Context) {
+    goto_line_impl(cx.editor, cx.count, Movement::Extend)
+}
+
+fn goto_line_impl(editor: &mut Editor, count: Option<NonZeroUsize>, movement: Movement) {
     if let Some(count) = count {
         let (view, doc) = current!(editor);
         let max_line = if doc.text().line(doc.text().len_lines() - 1).len_chars() == 0 {
@@ -2696,7 +2743,7 @@ fn goto_line_impl(editor: &mut Editor, count: Option<NonZeroUsize>) {
         let selection = doc
             .selection(view.id)
             .clone()
-            .transform(|range| range.put_cursor(text, pos, editor.mode == Mode::Select));
+            .transform(|range| range.put_cursor(text, pos, movement == Movement::Extend));
 
         push_jump(view, doc);
         doc.set_selection(view.id, selection);
@@ -2704,6 +2751,14 @@ fn goto_line_impl(editor: &mut Editor, count: Option<NonZeroUsize>) {
 }
 
 fn goto_last_line(cx: &mut Context) {
+    goto_last_line_impl(cx, movement_from_mode(cx.editor.mode))
+}
+
+fn extend_to_last_line(cx: &mut Context) {
+    goto_last_line_impl(cx, Movement::Extend)
+}
+
+fn goto_last_line_impl(cx: &mut Context, movement: Movement) {
     let (view, doc) = current!(cx.editor);
     let line_idx = if doc.text().line(doc.text().len_lines() - 1).len_chars() == 0 {
         // If the last line is blank, don't jump to it.
@@ -2716,7 +2771,7 @@ fn goto_last_line(cx: &mut Context) {
     let selection = doc
         .selection(view.id)
         .clone()
-        .transform(|range| range.put_cursor(text, pos, cx.editor.mode == Mode::Select));
+        .transform(|range| range.put_cursor(text, pos, movement == Movement::Extend));
 
     push_jump(view, doc);
     doc.set_selection(view.id, selection);
@@ -2732,6 +2787,14 @@ fn goto_last_accessed_file(cx: &mut Context) {
 }
 
 fn goto_last_modification(cx: &mut Context) {
+    goto_last_modification_impl(cx, movement_from_mode(cx.editor.mode))
+}
+
+fn extend_to_last_modification(cx: &mut Context) {
+    goto_last_modification_impl(cx, Movement::Extend)
+}
+
+fn goto_last_modification_impl(cx: &mut Context, movement: Movement) {
     let (view, doc) = current!(cx.editor);
     let pos = doc.history.get_mut().last_edit_pos();
     let text = doc.text().slice(..);
@@ -2739,7 +2802,7 @@ fn goto_last_modification(cx: &mut Context) {
         let selection = doc
             .selection(view.id)
             .clone()
-            .transform(|range| range.put_cursor(text, pos, cx.editor.mode == Mode::Select));
+            .transform(|range| range.put_cursor(text, pos, movement == Movement::Extend));
         doc.set_selection(view.id, selection);
     }
 }

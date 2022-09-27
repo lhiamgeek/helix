@@ -99,7 +99,7 @@ pub struct LanguageConfiguration {
     pub(crate) highlight_config: OnceCell<Option<Arc<HighlightConfiguration>>>,
     // tags_config OnceCell<> https://github.com/tree-sitter/tree-sitter/pull/583
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub language_servers: Vec<LanguageServerFeatureConfiguation>,
+    pub language_servers: Vec<LanguageServerFeatureConfiguration>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indent: Option<IndentationConfiguration>,
 
@@ -143,7 +143,7 @@ pub enum LanguageServerFeature {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged, rename_all = "kebab-case", deny_unknown_fields)]
-pub enum LanguageServerFeatureConfiguation {
+pub enum LanguageServerFeatureConfiguration {
     #[serde(rename_all = "kebab-case")]
     Features {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -471,11 +471,11 @@ impl LanguageConfiguration {
     }
 }
 
-impl LanguageServerFeatureConfiguation {
+impl LanguageServerFeatureConfiguration {
     pub fn name(&self) -> &String {
         match self {
-            LanguageServerFeatureConfiguation::Simple(name) => name,
-            LanguageServerFeatureConfiguation::Features { name, .. } => name,
+            LanguageServerFeatureConfiguration::Simple(name) => name,
+            LanguageServerFeatureConfiguration::Features { name, .. } => name,
         }
     }
 }

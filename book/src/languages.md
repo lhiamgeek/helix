@@ -111,7 +111,7 @@ Language servers are configured separately in the table `language-server` in the
 For example:
 
 ```toml
-[langauge-server.mylang-lsp]
+[language-server.mylang-lsp]
 command = "mylang-lsp"
 args = ["--stdio"]
 config = { provideFormatter = true }

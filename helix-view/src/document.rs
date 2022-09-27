@@ -1001,6 +1001,8 @@ impl Document {
                 return;
             }
             self.differ = Some(Differ::new(diff_base, self.text.clone()))
+        } else {
+            self.differ = None;
         }
     }
 

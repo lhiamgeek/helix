@@ -719,7 +719,7 @@ impl Editor {
             theme: theme_loader.default(),
             language_servers: helix_lsp::Registry::new(),
             diagnostics: BTreeMap::new(),
-            diff_providers: helix_vcs::DiffProviderRegistry::new(),
+            diff_providers: helix_vcs::DiffProviderRegistry::default(),
             debugger: None,
             debugger_events: SelectAll::new(),
             breakpoints: HashMap::new(),

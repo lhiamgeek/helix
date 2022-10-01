@@ -13,10 +13,10 @@ The default theme.toml can be found [here](https://github.com/helix-editor/helix
 Each line in the theme file is specified as below:
 
 ```toml
-key = { fg = "#ffffff", bg = "#000000", modifiers = ["bold", "italic"] }
+key = { fg = "#ffffff", bg = "#000000", underline_color = "#ff0000", underline_style = "curl", modifiers = ["bold", "italic"] }
 ```
 
-where `key` represents what you want to style, `fg` specifies the foreground color, `bg` the background color, and `modifiers` is a list of style modifiers. `bg` and `modifiers` can be omitted to defer to the defaults.
+where `key` represents what you want to style, `fg` specifies the foreground color, `bg` the background color, `underline_style` the underline style, `underline_color` the underline color (only meaningful if an underline style is enabled), and `modifiers` is a list of style modifiers. `bg`, `underline` and `modifiers` can be omitted to defer to the defaults.
 
 To specify only the foreground color:
 
@@ -77,17 +77,32 @@ The following values may be used as modifiers.
 
 Less common modifiers might not be supported by your terminal emulator.
 
+| Modifier             |
+| ---                  |
+| `bold`               |
+| `dim`                |
+| `italic`             |
+| `underlined`         |
+| `slow_blink`         |
+| `rapid_blink`        |
+| `reversed`           |
+| `hidden`             |
+| `crossed_out`        |
+
+### Underline Style
+
+One of the following values may be used as an `underline_styles`. 
+
+Some styles might not be supported by your terminal emulator.
+
 | Modifier       |
 | ---            |
-| `bold`         |
-| `dim`          |
-| `italic`       |
-| `underlined`   |
-| `slow_blink`   |
-| `rapid_blink`  |
-| `reversed`     |
-| `hidden`       |
-| `crossed_out`  |
+| `line`         |
+| `curl`         |
+| `dashed`       |
+| `dot`          |
+| `double-line`  |
+
 
 ### Rainbow
 

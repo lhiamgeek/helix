@@ -3,6 +3,7 @@ use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use helix_core::auto_pairs::AutoPairs;
 use helix_core::Range;
+use helix_vcs::Differ;
 use serde::de::{self, Deserialize, Deserializer};
 use serde::Serialize;
 use std::cell::Cell;
@@ -120,6 +121,8 @@ pub struct Document {
 
     diagnostics: Vec<Diagnostic>,
     language_server: Option<Arc<helix_lsp::Client>>,
+
+    differ: Option<Differ>,
 }
 
 use std::{fmt, mem};
@@ -358,6 +361,7 @@ impl Document {
             last_saved_revision: 0,
             modified_since_accessed: false,
             language_server: None,
+            differ: None,
         }
     }
 
@@ -804,6 +808,9 @@ impl Document {
                     tokio::spawn(notify);
                 }
             }
+            if let Some(differ) = self.differ.as_ref() {
+                differ.update_document(self.text.clone());
+            }
         }
         success
     }
@@ -980,6 +987,23 @@ impl Document {
     pub fn language_server(&self) -> Option<&helix_lsp::Client> {
         let server = self.language_server.as_deref()?;
         server.is_initialized().then(|| server)
+    }
+
+    pub fn differ(&self) -> Option<&Differ> {
+        self.differ.as_ref()
+    }
+
+    /// Intialize/updates the differ for this document with a new base.
+    pub fn set_diff_base(&mut self, diff_base: Vec<u8>) {
+        if let Ok((diff_base, _)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding)) {
+            if let Some(differ) = &self.differ {
+                differ.update_diff_base(diff_base);
+                return;
+            }
+            self.differ = Some(Differ::new(diff_base, self.text.clone()))
+        } else {
+            self.differ = None;
+        }
     }
 
     #[inline]

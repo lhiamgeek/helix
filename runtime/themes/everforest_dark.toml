@@ -78,7 +78,12 @@
 "info" = "aqua"
 "warning" = "yellow"
 "error" = "red"
-"diagnostic" = { modifiers = ["underlined"] }
+
+"diagnostic.error" = { underline_color = "red", underline_style = "curl" }
+"diagnostic.warning" = { underline_color = "yellow", underline_style = "curl" }
+"diagnostic.info" = { underline_color = "aqua", underline_style = "curl" }
+"diagnostic.hint" = { underline_color = "blue", underline_style = "curl" }
+"diagnostic" = { underline_color = "blue", underline_style = "curl" }
 
 
 [palette]

@@ -1,7 +1,9 @@
 use std::fmt::Write;
 
+use helix_vcs::LineDiff;
+
 use crate::{
-    graphics::{Color, Modifier, Style},
+    graphics::{Color, Style, UnderlineStyle},
     Document, Editor, Theme, View,
 };
 
@@ -47,6 +49,31 @@ pub fn diagnostic<'doc>(
             });
         }
         None
+    })
+}
+
+pub fn diff<'doc>(
+    _editor: &'doc Editor,
+    doc: &'doc Document,
+    _view: &View,
+    theme: &Theme,
+    _is_focused: bool,
+    _width: usize,
+) -> GutterFn<'doc> {
+    let added = theme.get("diff.plus");
+    let deleted = theme.get("diff.minus");
+    let modified = theme.get("diff.delta");
+
+    Box::new(move |line: usize, _selected: bool, out: &mut String| {
+        let diff = *doc.differ()?.get_line_diffs().get(&line)?;
+
+        let (icon, style) = match diff {
+            LineDiff::Added => ("▍", added),
+            LineDiff::Deleted => ("▔", deleted),
+            LineDiff::Modified => ("▍", modified),
+        };
+        write!(out, "{}", icon).unwrap();
+        Some(style)
     })
 }
 
@@ -147,7 +174,7 @@ pub fn breakpoints<'doc>(
             .find(|breakpoint| breakpoint.line == line)?;
 
         let mut style = if breakpoint.condition.is_some() && breakpoint.log_message.is_some() {
-            error.add_modifier(Modifier::UNDERLINED)
+            error.underline_style(UnderlineStyle::Line)
         } else if breakpoint.condition.is_some() {
             error
         } else if breakpoint.log_message.is_some() {

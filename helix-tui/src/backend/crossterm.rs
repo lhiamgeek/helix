@@ -4,15 +4,45 @@ use crossterm::{
     execute, queue,
     style::{
         Attribute as CAttribute, Color as CColor, Print, SetAttribute, SetBackgroundColor,
-        SetForegroundColor,
+        SetForegroundColor, SetUnderlineColor,
     },
     terminal::{self, Clear, ClearType},
 };
-use helix_view::graphics::{Color, CursorKind, Modifier, Rect};
+use helix_view::graphics::{Color, CursorKind, Modifier, Rect, UnderlineStyle};
 use std::io::{self, Write};
+
+fn vte_version() -> Option<usize> {
+    std::env::var("VTE_VERSION").ok()?.parse().ok()
+}
+
+/// Describes terminal capabilities like extended underline, truecolor, etc.
+#[derive(Copy, Clone, Debug, Default)]
+struct Capabilities {
+    /// Support for undercurled, underdashed, etc.
+    has_extended_underlines: bool,
+}
+
+impl Capabilities {
+    /// Detect capabilities from the terminfo database located based
+    /// on the $TERM environment variable. If detection fails, returns
+    /// a default value where no capability is supported.
+    pub fn from_env_or_default() -> Self {
+        match cxterminfo::terminfo::TermInfo::from_env() {
+            Err(_) => Capabilities::default(),
+            Ok(t) => Capabilities {
+                // Smulx, VTE: https://unix.stackexchange.com/a/696253/246284
+                // Su (used by kitty): https://sw.kovidgoyal.net/kitty/underlines
+                has_extended_underlines: t.get_ext_string("Smulx").is_some()
+                    || *t.get_ext_bool("Su").unwrap_or(&false)
+                    || vte_version() >= Some(5102),
+            },
+        }
+    }
+}
 
 pub struct CrosstermBackend<W: Write> {
     buffer: W,
+    capabilities: Capabilities,
 }
 
 impl<W> CrosstermBackend<W>
@@ -20,7 +50,10 @@ where
     W: Write,
 {
     pub fn new(buffer: W) -> CrosstermBackend<W> {
-        CrosstermBackend { buffer }
+        CrosstermBackend {
+            buffer,
+            capabilities: Capabilities::from_env_or_default(),
+        }
     }
 }
 
@@ -47,6 +80,8 @@ where
     {
         let mut fg = Color::Reset;
         let mut bg = Color::Reset;
+        let mut underline_color = Color::Reset;
+        let mut underline_style = UnderlineStyle::Reset;
         let mut modifier = Modifier::empty();
         let mut last_pos: Option<(u16, u16)> = None;
         for (x, y, cell) in content {
@@ -73,12 +108,32 @@ where
                 map_error(queue!(self.buffer, SetBackgroundColor(color)))?;
                 bg = cell.bg;
             }
+            if cell.underline_color != underline_color {
+                let color = CColor::from(cell.underline_color);
+                map_error(queue!(self.buffer, SetUnderlineColor(color)))?;
+                underline_color = cell.underline_color;
+            }
+
+            let mut new_underline_style = cell.underline_style;
+            if !self.capabilities.has_extended_underlines {
+                match new_underline_style {
+                    UnderlineStyle::Reset => (),
+                    _ => new_underline_style = UnderlineStyle::Line,
+                }
+            }
+
+            if new_underline_style != underline_style {
+                let attr = CAttribute::from(cell.underline_style);
+                map_error(queue!(self.buffer, SetAttribute(attr)))?;
+                underline_style = new_underline_style;
+            }
 
             map_error(queue!(self.buffer, Print(&cell.symbol)))?;
         }
 
         map_error(queue!(
             self.buffer,
+            SetUnderlineColor(CColor::Reset),
             SetForegroundColor(CColor::Reset),
             SetBackgroundColor(CColor::Reset),
             SetAttribute(CAttribute::Reset)
@@ -153,9 +208,6 @@ impl ModifierDiff {
         if removed.contains(Modifier::ITALIC) {
             map_error(queue!(w, SetAttribute(CAttribute::NoItalic)))?;
         }
-        if removed.contains(Modifier::UNDERLINED) {
-            map_error(queue!(w, SetAttribute(CAttribute::NoUnderline)))?;
-        }
         if removed.contains(Modifier::DIM) {
             map_error(queue!(w, SetAttribute(CAttribute::NormalIntensity)))?;
         }
@@ -175,9 +227,6 @@ impl ModifierDiff {
         }
         if added.contains(Modifier::ITALIC) {
             map_error(queue!(w, SetAttribute(CAttribute::Italic)))?;
-        }
-        if added.contains(Modifier::UNDERLINED) {
-            map_error(queue!(w, SetAttribute(CAttribute::Underlined)))?;
         }
         if added.contains(Modifier::DIM) {
             map_error(queue!(w, SetAttribute(CAttribute::Dim)))?;

@@ -2,10 +2,12 @@ use crate::{
     auto_pairs::AutoPairs,
     chars::char_is_line_ending,
     diagnostic::Severity,
+    graphemes::ensure_grapheme_boundary_next_byte,
     regex::Regex,
     transaction::{ChangeSet, Operation},
     Rope, RopeSlice, Tendril,
 };
+pub use overlay::{monotonic_overlay, overlapping_overlay, Span};
 
 use arc_swap::{ArcSwap, Guard};
 use slotmap::{DefaultKey as LayerId, HopSlotMap};
@@ -24,6 +26,8 @@ use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 
 use helix_loader::grammar::{get_language, load_runtime_file};
+
+mod overlay;
 
 fn deserialize_regex<'de, D>(deserializer: D) -> Result<Option<Regex>, D::Error>
 where
@@ -400,6 +404,8 @@ impl LanguageConfiguration {
         // always highlight syntax errors
         // highlights_query += "\n(ERROR) @error";
 
+        let rainbows_query = read_query(&language, "rainbows.scm");
+
         let injections_query = read_query(&language, "injections.scm");
         let locals_query = read_query(&language, "locals.scm");
 
@@ -412,6 +418,7 @@ impl LanguageConfiguration {
             let config = HighlightConfiguration::new(
                 language,
                 &highlights_query,
+                &rainbows_query,
                 &injections_query,
                 &locals_query,
             )
@@ -942,7 +949,7 @@ impl Syntax {
         source: RopeSlice<'a>,
         range: Option<std::ops::Range<usize>>,
         cancellation_flag: Option<&'a AtomicUsize>,
-    ) -> impl Iterator<Item = Result<HighlightEvent, Error>> + 'a {
+    ) -> HighlightIter<'a> {
         let mut layers = self
             .layers
             .iter()
@@ -976,14 +983,13 @@ impl Syntax {
                 captures.peek()?;
 
                 Some(HighlightIterLayer {
-                    highlight_end_stack: Vec::new(),
-                    scope_stack: vec![LocalScope {
+                    context: vec![LocalScope {
                         inherits: false,
                         range: 0..usize::MAX,
                         local_defs: Vec::new(),
                     }],
+                    highlight_end_stack: Vec::new(),
                     cursor,
-                    _tree: None,
                     captures,
                     config: layer.config.as_ref(), // TODO: just reuse `layer`
                     depth: layer.depth,            // TODO: just reuse `layer`
@@ -1000,17 +1006,96 @@ impl Syntax {
             )
         });
 
-        let mut result = HighlightIter {
+        let mut result = HighlightIterInner {
             source,
-            byte_offset: range.map_or(0, |r| r.start),
             cancellation_flag,
             iter_count: 0,
             layers,
-            next_event: None,
             last_highlight_range: None,
+            context: HighlightIterContext {
+                byte_offset: range.map_or(0, |r| r.start),
+                next_event: None,
+            },
         };
         result.sort_layers();
-        result
+        HighlightIter(result)
+    }
+
+    /// Iterate over the rainbow-highlighted regions for a given slice of source code.
+    pub fn rainbow_iter<'a>(
+        &'a self,
+        source: RopeSlice<'a>,
+        range: Option<std::ops::Range<usize>>,
+        cancellation_flag: Option<&'a AtomicUsize>,
+        rainbow_length: usize,
+    ) -> RainbowIter<'a> {
+        let mut layers = self
+            .layers
+            .iter()
+            .filter_map(|(_, layer)| {
+                // TODO: if range doesn't overlap layer range, skip it
+
+                // Reuse a cursor from the pool if available.
+                let mut cursor = PARSER.with(|ts_parser| {
+                    let highlighter = &mut ts_parser.borrow_mut();
+                    highlighter.cursors.pop().unwrap_or_else(QueryCursor::new)
+                });
+
+                // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
+                // prevents them from being moved. But both of these values are really just
+                // pointers, so it's actually ok to move them.
+                let cursor_ref =
+                    unsafe { mem::transmute::<_, &'static mut QueryCursor>(&mut cursor) };
+
+                // if reusing cursors & no range this resets to whole range
+                cursor_ref.set_byte_range(range.clone().unwrap_or(0..usize::MAX));
+
+                let mut captures = cursor_ref
+                    .captures(
+                        &layer.config.rainbow_query,
+                        layer.tree().root_node(),
+                        RopeProvider(source),
+                    )
+                    .peekable();
+
+                // If there's no captures, skip the layer
+                captures.peek()?;
+
+                Some(RainbowIterLayer {
+                    context: (),
+                    highlight_end_stack: Vec::new(),
+                    cursor,
+                    captures,
+                    config: layer.config.as_ref(), // TODO: just reuse `layer`
+                    depth: layer.depth,            // TODO: just reuse `layer`
+                    ranges: &layer.ranges,         // TODO: temp
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // HAXX: arrange layers by byte range, with deeper layers positioned first
+        layers.sort_by_key(|layer| {
+            (
+                layer.ranges.first().cloned(),
+                std::cmp::Reverse(layer.depth),
+            )
+        });
+
+        let context = RainbowIterContext {
+            rainbow_stack: Vec::new(),
+            rainbow_length,
+        };
+
+        let mut result = RainbowIterInner {
+            source,
+            cancellation_flag,
+            iter_count: 0,
+            layers,
+            last_highlight_range: None,
+            context,
+        };
+        result.sort_layers();
+        RainbowIter(result)
     }
 
     // Commenting
@@ -1023,6 +1108,18 @@ impl Syntax {
     // indent_level_for_line
 
     // TODO: Folding
+}
+
+/// Finds the child of `node` which contains the given byte range `range`.
+pub fn child_for_byte_range(node: Node, range: std::ops::Range<usize>) -> Option<Node> {
+    for child in node.children(&mut node.walk()) {
+        let child_range = child.byte_range();
+        if range.start >= child_range.start && range.end <= child_range.end {
+            return Some(child);
+        }
+    }
+
+    None
 }
 
 #[derive(Debug)]
@@ -1199,7 +1296,7 @@ pub enum Error {
 }
 
 /// Represents a single step in rendering a syntax-highlighted document.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum HighlightEvent {
     Source { start: usize, end: usize },
     HighlightStart(Highlight),
@@ -1212,7 +1309,8 @@ pub enum HighlightEvent {
 #[derive(Debug)]
 pub struct HighlightConfiguration {
     pub language: Grammar,
-    pub query: Query,
+    query: Query,
+    rainbow_query: Query,
     injections_query: Query,
     combined_injections_query: Option<Query>,
     highlights_pattern_index: usize,
@@ -1224,6 +1322,24 @@ pub struct HighlightConfiguration {
     local_def_capture_index: Option<u32>,
     local_def_value_capture_index: Option<u32>,
     local_ref_capture_index: Option<u32>,
+    rainbow_scope_capture_index: Option<u32>,
+    rainbow_bracket_capture_index: Option<u32>,
+}
+
+#[derive(Debug)]
+struct HighlightIterContext {
+    next_event: Option<HighlightEvent>,
+    byte_offset: usize,
+}
+
+#[derive(Debug)]
+pub struct QueryIter<'a, C, L> {
+    source: RopeSlice<'a>,
+    cancellation_flag: Option<&'a AtomicUsize>,
+    context: C,
+    iter_count: usize,
+    layers: Vec<L>,
+    last_highlight_range: Option<(usize, usize, usize)>,
 }
 
 #[derive(Debug)]
@@ -1240,16 +1356,92 @@ struct LocalScope<'a> {
     local_defs: Vec<LocalDef<'a>>,
 }
 
+type HighlightIterInner<'a> = QueryIter<'a, HighlightIterContext, HighlightIterLayer<'a>>;
+
 #[derive(Debug)]
-struct HighlightIter<'a> {
-    source: RopeSlice<'a>,
-    byte_offset: usize,
-    cancellation_flag: Option<&'a AtomicUsize>,
-    layers: Vec<HighlightIterLayer<'a>>,
-    iter_count: usize,
-    next_event: Option<HighlightEvent>,
-    last_highlight_range: Option<(usize, usize, usize)>,
+pub struct HighlightIter<'a>(HighlightIterInner<'a>);
+
+impl<'a> Iterator for HighlightIter<'a> {
+    type Item = Result<HighlightEvent, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
 }
+
+impl<'a> HighlightIter<'a> {
+    pub fn to_chars(self) -> CharacterHighlightIter<'a> {
+        CharacterHighlightIter(self.0)
+    }
+}
+
+#[derive(Debug)]
+pub struct CharacterHighlightIter<'a>(HighlightIterInner<'a>);
+
+impl Iterator for CharacterHighlightIter<'_> {
+    type Item = HighlightEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let res = match self.0.next()?.unwrap() {
+            HighlightEvent::Source { start, end } => {
+                let text = self.0.source;
+                let start = text.byte_to_char(ensure_grapheme_boundary_next_byte(text, start));
+                let end = text.byte_to_char(ensure_grapheme_boundary_next_byte(text, end));
+                HighlightEvent::Source { start, end }
+            }
+            event => event,
+        };
+
+        Some(res)
+    }
+}
+
+#[derive(Debug)]
+pub struct RainbowIter<'a>(RainbowIterInner<'a>);
+
+impl<'a> Iterator for RainbowIter<'a> {
+    type Item = Result<Span, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+impl<'a> RainbowIter<'a> {
+    pub fn to_chars(self) -> CharacterRainbowIter<'a> {
+        CharacterRainbowIter(self.0)
+    }
+}
+
+#[derive(Debug)]
+pub struct CharacterRainbowIter<'a>(RainbowIterInner<'a>);
+
+impl Iterator for CharacterRainbowIter<'_> {
+    type Item = Span;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut res = self.0.next()?.unwrap();
+        let text = self.0.source;
+        res.start = text.byte_to_char(ensure_grapheme_boundary_next_byte(text, res.start));
+        res.end = text.byte_to_char(ensure_grapheme_boundary_next_byte(text, res.end));
+        Some(res)
+    }
+}
+
+#[derive(Debug)]
+struct RainbowScope {
+    pub range: ops::Range<usize>,
+    pub node_id: usize,
+    pub highlight: Highlight,
+}
+
+#[derive(Debug)]
+struct RainbowIterContext {
+    rainbow_stack: Vec<RainbowScope>,
+    rainbow_length: usize,
+}
+
+type RainbowIterInner<'a> = QueryIter<'a, RainbowIterContext, RainbowIterLayer<'a>>;
 
 // Adapter to convert rope chunks to bytes
 pub struct ChunksBytes<'a> {
@@ -1274,22 +1466,25 @@ impl<'a> TextProvider<'a> for RopeProvider<'a> {
     }
 }
 
-struct HighlightIterLayer<'a> {
-    _tree: Option<Tree>,
+struct QueryIterLayer<'a, C> {
     cursor: QueryCursor,
     captures: iter::Peekable<QueryCaptures<'a, 'a, RopeProvider<'a>>>,
     config: &'a HighlightConfiguration,
     highlight_end_stack: Vec<usize>,
-    scope_stack: Vec<LocalScope<'a>>,
     depth: usize,
     ranges: &'a [Range],
+    context: C,
 }
 
-impl<'a> fmt::Debug for HighlightIterLayer<'a> {
+impl<'a, C> fmt::Debug for QueryIterLayer<'a, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HighlightIterLayer").finish()
+        f.debug_struct("QueryIterLayer").finish()
     }
 }
+
+type HighlightIterLayer<'a> = QueryIterLayer<'a, Vec<LocalScope<'a>>>;
+
+type RainbowIterLayer<'a> = QueryIterLayer<'a, ()>;
 
 impl HighlightConfiguration {
     /// Creates a `HighlightConfiguration` for a given `Grammar` and set of highlighting
@@ -1309,6 +1504,7 @@ impl HighlightConfiguration {
     pub fn new(
         language: Grammar,
         highlights_query: &str,
+        rainbow_query: &str,
         injection_query: &str,
         locals_query: &str,
     ) -> Result<Self, QueryError> {
@@ -1328,6 +1524,7 @@ impl HighlightConfiguration {
                 highlights_pattern_index += 1;
             }
         }
+        let rainbow_query = Query::new(language, rainbow_query)?;
 
         let mut injections_query = Query::new(language, injection_query)?;
 
@@ -1368,6 +1565,8 @@ impl HighlightConfiguration {
         let mut local_def_value_capture_index = None;
         let mut local_ref_capture_index = None;
         let mut local_scope_capture_index = None;
+        let mut rainbow_scope_capture_index = None;
+        let mut rainbow_bracket_capture_index = None;
         for (i, name) in query.capture_names().iter().enumerate() {
             let i = Some(i as u32);
             match name.as_str() {
@@ -1378,7 +1577,14 @@ impl HighlightConfiguration {
                 _ => {}
             }
         }
-
+        for (i, name) in rainbow_query.capture_names().iter().enumerate() {
+            let i = Some(i as u32);
+            match name.as_str() {
+                "rainbow.scope" => rainbow_scope_capture_index = i,
+                "rainbow.bracket" => rainbow_bracket_capture_index = i,
+                _ => {}
+            }
+        }
         for (i, name) in injections_query.capture_names().iter().enumerate() {
             let i = Some(i as u32);
             match name.as_str() {
@@ -1392,6 +1598,7 @@ impl HighlightConfiguration {
         Ok(Self {
             language,
             query,
+            rainbow_query,
             injections_query,
             combined_injections_query,
             highlights_pattern_index,
@@ -1403,6 +1610,8 @@ impl HighlightConfiguration {
             local_def_capture_index,
             local_def_value_capture_index,
             local_ref_capture_index,
+            rainbow_scope_capture_index,
+            rainbow_bracket_capture_index,
         })
     }
 
@@ -1459,7 +1668,7 @@ impl HighlightConfiguration {
     }
 }
 
-impl<'a> HighlightIterLayer<'a> {
+impl<'a, C> QueryIterLayer<'a, C> {
     // First, sort scope boundaries by their byte offset in the document. At a
     // given position, emit scope endings before scope beginnings. Finally, emit
     // scope boundaries from deeper layers first.
@@ -1596,27 +1805,29 @@ fn intersect_ranges(
     result
 }
 
-impl<'a> HighlightIter<'a> {
+impl<'a, LC> QueryIter<'a, HighlightIterContext, QueryIterLayer<'a, LC>> {
     fn emit_event(
         &mut self,
         offset: usize,
         event: Option<HighlightEvent>,
     ) -> Option<Result<HighlightEvent, Error>> {
         let result;
-        if self.byte_offset < offset {
+        if self.context.byte_offset < offset {
             result = Some(Ok(HighlightEvent::Source {
-                start: self.byte_offset,
+                start: self.context.byte_offset,
                 end: offset,
             }));
-            self.byte_offset = offset;
-            self.next_event = event;
+            self.context.byte_offset = offset;
+            self.context.next_event = event;
         } else {
             result = event.map(Ok);
         }
         self.sort_layers();
         result
     }
+}
 
+impl<'a, C, LC> QueryIter<'a, C, QueryIterLayer<'a, LC>> {
     fn sort_layers(&mut self) {
         while !self.layers.is_empty() {
             if let Some(sort_key) = self.layers[0].sort_key() {
@@ -1649,77 +1860,98 @@ impl<'a> HighlightIter<'a> {
             }
         }
     }
+
+    /// Scans forward to the next capture from whichever layer has the earliest highlight
+    /// boundary, returning highlight-end events or terminating the iterator if there
+    /// are no more captures or highlight-end events.
+    fn scan_to_earliest_capture(&mut self) -> Option<(usize, Option<HighlightEvent>)> {
+        let range;
+        let layer = &mut self.layers[0];
+        if let Some((next_match, capture_index)) = layer.captures.peek() {
+            let next_capture = next_match.captures[*capture_index];
+            range = next_capture.node.byte_range();
+
+            // If any previous highlight ends before this node starts, then before
+            // processing this capture, emit the source code up until the end of the
+            // previous highlight, and an end event for that highlight.
+            if let Some(end_byte) = layer.highlight_end_stack.last().cloned() {
+                if end_byte <= range.start {
+                    layer.highlight_end_stack.pop();
+                    return Some((end_byte, Some(HighlightEvent::HighlightEnd)));
+                }
+            }
+        }
+        // If there are no more captures, then emit any remaining highlight end events.
+        // And if there are none of those, then just advance to the end of the document.
+        else if let Some(end_byte) = layer.highlight_end_stack.pop() {
+            return Some((end_byte, Some(HighlightEvent::HighlightEnd)));
+        }
+        // And if there are none of those, then just advance to the end of the document.
+        else {
+            return Some((self.source.len_bytes(), None));
+        };
+        None
+    }
+
+    /// Check for cancellation, returning a `Cancelled` error if the cancellation
+    /// flag was flipped or the iteration count is too high.
+    fn check_cancellation(&mut self) -> Result<(), Error> {
+        if let Some(cancellation_flag) = self.cancellation_flag {
+            self.iter_count += 1;
+            if self.iter_count >= CANCELLATION_CHECK_INTERVAL {
+                self.iter_count = 0;
+                if cancellation_flag.load(Ordering::Relaxed) != 0 {
+                    return Err(Error::Cancelled);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-impl<'a> Iterator for HighlightIter<'a> {
+impl<'a> Iterator for HighlightIterInner<'a> {
     type Item = Result<HighlightEvent, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         'main: loop {
             // If we've already determined the next highlight boundary, just return it.
-            if let Some(e) = self.next_event.take() {
+            if let Some(e) = self.context.next_event.take() {
                 return Some(Ok(e));
             }
 
-            // Periodically check for cancellation, returning `Cancelled` error if the
-            // cancellation flag was flipped.
-            if let Some(cancellation_flag) = self.cancellation_flag {
-                self.iter_count += 1;
-                if self.iter_count >= CANCELLATION_CHECK_INTERVAL {
-                    self.iter_count = 0;
-                    if cancellation_flag.load(Ordering::Relaxed) != 0 {
-                        return Some(Err(Error::Cancelled));
-                    }
-                }
+            // If the iterator has been cancelled, return an Error.
+            if let Err(err) = self.check_cancellation() {
+                return Some(Err(err));
             }
 
             // If none of the layers have any more highlight boundaries, terminate.
             if self.layers.is_empty() {
                 let len = self.source.len_bytes();
-                return if self.byte_offset < len {
+                return if self.context.byte_offset < len {
                     let result = Some(Ok(HighlightEvent::Source {
-                        start: self.byte_offset,
+                        start: self.context.byte_offset,
                         end: len,
                     }));
-                    self.byte_offset = len;
+                    self.context.byte_offset = len;
                     result
                 } else {
                     None
                 };
             }
 
-            // Get the next capture from whichever layer has the earliest highlight boundary.
-            let range;
-            let layer = &mut self.layers[0];
-            if let Some((next_match, capture_index)) = layer.captures.peek() {
-                let next_capture = next_match.captures[*capture_index];
-                range = next_capture.node.byte_range();
-
-                // If any previous highlight ends before this node starts, then before
-                // processing this capture, emit the source code up until the end of the
-                // previous highlight, and an end event for that highlight.
-                if let Some(end_byte) = layer.highlight_end_stack.last().cloned() {
-                    if end_byte <= range.start {
-                        layer.highlight_end_stack.pop();
-                        return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
-                    }
-                }
-            }
-            // If there are no more captures, then emit any remaining highlight end events.
-            // And if there are none of those, then just advance to the end of the document.
-            else if let Some(end_byte) = layer.highlight_end_stack.last().cloned() {
-                layer.highlight_end_stack.pop();
-                return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
-            } else {
-                return self.emit_event(self.source.len_bytes(), None);
+            if let Some((offset, event)) = self.scan_to_earliest_capture() {
+                return self.emit_event(offset, event);
             };
 
+            let layer = &mut self.layers[0];
             let (mut match_, capture_index) = layer.captures.next().unwrap();
             let mut capture = match_.captures[capture_index];
+            let range = capture.node.byte_range();
 
             // Remove from the local scope stack any local scopes that have already ended.
-            while range.start > layer.scope_stack.last().unwrap().range.end {
-                layer.scope_stack.pop();
+            // We can unwrap safely because a local scope exists for `0..usize::MAX`.
+            while range.start > layer.context.last().unwrap().range.end {
+                layer.context.pop();
             }
 
             // If this capture is for tracking local variables, then process the
@@ -1742,13 +1974,13 @@ impl<'a> Iterator for HighlightIter<'a> {
                                 prop.value.as_ref().map_or(true, |r| r.as_ref() == "true");
                         }
                     }
-                    layer.scope_stack.push(scope);
+                    layer.context.push(scope);
                 }
                 // If the node represents a definition, add a new definition to the
                 // local scope at the top of the scope stack.
                 else if Some(capture.index) == layer.config.local_def_capture_index {
                     reference_highlight = None;
-                    let scope = layer.scope_stack.last_mut().unwrap();
+                    let scope = layer.context.last_mut().unwrap();
 
                     let mut value_range = 0..0;
                     for capture in match_.captures {
@@ -1772,7 +2004,7 @@ impl<'a> Iterator for HighlightIter<'a> {
                 {
                     definition_highlight = None;
                     let name = byte_range_to_str(range.clone(), self.source);
-                    for scope in layer.scope_stack.iter().rev() {
+                    for scope in layer.context.iter().rev() {
                         if let Some(highlight) = scope.local_defs.iter().rev().find_map(|def| {
                             if def.name == name && range.start >= def.value_range.end {
                                 Some(def.highlight)
@@ -1866,6 +2098,117 @@ impl<'a> Iterator for HighlightIter<'a> {
     }
 }
 
+impl<'a> Iterator for RainbowIterInner<'a> {
+    type Item = Result<Span, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        'main: loop {
+            // If the iterator has been cancelled, return an Error.
+            if let Err(err) = self.check_cancellation() {
+                return Some(Err(err));
+            }
+
+            // If none of the layers have any more highlight boundaries, terminate.
+            if self.layers.is_empty() {
+                return None;
+            }
+
+            if self.scan_to_earliest_capture().is_some() {
+                self.sort_layers();
+                continue 'main;
+            }
+
+            let layer = &mut self.layers[0];
+            let (match_, capture_index) = layer.captures.next()?;
+            let capture = match_.captures[capture_index];
+            let range = capture.node.byte_range();
+
+            // Remove from the rainbow scope stack any rainbow scopes that have already ended.
+            while let Some(scope) = self.context.rainbow_stack.last() {
+                if range.start >= scope.range.end {
+                    self.context.rainbow_stack.pop();
+                } else {
+                    break;
+                }
+            }
+
+            // If the node represents a rainbow scope, push a new rainbow scope onto
+            // the scope stack.
+            if Some(capture.index) == layer.config.rainbow_scope_capture_index {
+                let mut scope = RainbowScope {
+                    range: range.clone(),
+                    node_id: capture.node.id(),
+                    highlight: Highlight(
+                        self.context.rainbow_stack.len() % self.context.rainbow_length,
+                    ),
+                };
+                for prop in layer
+                    .config
+                    .rainbow_query
+                    .property_settings(match_.pattern_index)
+                {
+                    if prop.key.as_ref() == "rainbow.include-children" {
+                        scope.node_id = usize::MAX;
+                    }
+                }
+                self.context.rainbow_stack.push(scope);
+                continue 'main;
+            }
+
+            // Otherwise, this capture must represent a highlight.
+            // If this exact range has already been highlighted by an earlier pattern, or by
+            // a different layer, then skip over this one.
+            if let Some((last_start, last_end, last_depth)) = self.last_highlight_range {
+                if range.start == last_start && range.end == last_end && layer.depth < last_depth {
+                    self.sort_layers();
+                    continue 'main;
+                }
+            }
+
+            let mut rainbow_highlight = None;
+
+            if Some(capture.index) == layer.config.rainbow_bracket_capture_index {
+                if let Some(scope) = self.context.rainbow_stack.last() {
+                    // If the scope includes all children or if this capture is a direct descendant of
+                    // the scope's captured node then this capture inherits the scope's highlight.
+                    if scope.node_id == usize::MAX
+                        || capture.node.parent().map(|p| p.id()) == Some(scope.node_id)
+                    {
+                        rainbow_highlight = Some(scope.highlight);
+                    }
+                }
+            }
+
+            // Once a highlighting pattern is found for the current node, skip over
+            // any later highlighting patterns that also match this node. Captures
+            // for a given node are ordered by pattern index, so these subsequent
+            // captures are guaranteed to be for highlighting, not injections or
+            // local variables.
+            while let Some((next_match, next_capture_index)) = layer.captures.peek() {
+                let next_capture = next_match.captures[*next_capture_index];
+                if next_capture.node == capture.node {
+                    layer.captures.next();
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(scope) = rainbow_highlight {
+                self.last_highlight_range = Some((range.start, range.end, layer.depth));
+                layer.highlight_end_stack.push(range.end);
+                self.sort_layers();
+                return Some(Ok(Span {
+                    scope,
+                    start: range.start,
+                    end: range.end,
+                }));
+            }
+
+            self.sort_layers();
+        }
+    }
+}
+
 fn injection_for_match<'a>(
     config: &HighlightConfiguration,
     query: &'a Query,
@@ -1916,140 +2259,6 @@ fn injection_for_match<'a>(
     (language_name, content_node, included_children)
 }
 
-pub struct Merge<I> {
-    iter: I,
-    spans: Box<dyn Iterator<Item = (usize, std::ops::Range<usize>)>>,
-
-    next_event: Option<HighlightEvent>,
-    next_span: Option<(usize, std::ops::Range<usize>)>,
-
-    queue: Vec<HighlightEvent>,
-}
-
-/// Merge a list of spans into the highlight event stream.
-pub fn merge<I: Iterator<Item = HighlightEvent>>(
-    iter: I,
-    spans: Vec<(usize, std::ops::Range<usize>)>,
-) -> Merge<I> {
-    let spans = Box::new(spans.into_iter());
-    let mut merge = Merge {
-        iter,
-        spans,
-        next_event: None,
-        next_span: None,
-        queue: Vec::new(),
-    };
-    merge.next_event = merge.iter.next();
-    merge.next_span = merge.spans.next();
-    merge
-}
-
-impl<I: Iterator<Item = HighlightEvent>> Iterator for Merge<I> {
-    type Item = HighlightEvent;
-    fn next(&mut self) -> Option<Self::Item> {
-        use HighlightEvent::*;
-        if let Some(event) = self.queue.pop() {
-            return Some(event);
-        }
-
-        loop {
-            match (self.next_event, &self.next_span) {
-                // this happens when range is partially or fully offscreen
-                (Some(Source { start, .. }), Some((span, range))) if start > range.start => {
-                    if start > range.end {
-                        self.next_span = self.spans.next();
-                    } else {
-                        self.next_span = Some((*span, start..range.end));
-                    };
-                }
-                _ => break,
-            }
-        }
-
-        match (self.next_event, &self.next_span) {
-            (Some(HighlightStart(i)), _) => {
-                self.next_event = self.iter.next();
-                Some(HighlightStart(i))
-            }
-            (Some(HighlightEnd), _) => {
-                self.next_event = self.iter.next();
-                Some(HighlightEnd)
-            }
-            (Some(Source { start, end }), Some((_, range))) if start < range.start => {
-                let intersect = range.start.min(end);
-                let event = Source {
-                    start,
-                    end: intersect,
-                };
-
-                if end == intersect {
-                    // the event is complete
-                    self.next_event = self.iter.next();
-                } else {
-                    // subslice the event
-                    self.next_event = Some(Source {
-                        start: intersect,
-                        end,
-                    });
-                };
-
-                Some(event)
-            }
-            (Some(Source { start, end }), Some((span, range))) if start == range.start => {
-                let intersect = range.end.min(end);
-                let event = HighlightStart(Highlight(*span));
-
-                // enqueue in reverse order
-                self.queue.push(HighlightEnd);
-                self.queue.push(Source {
-                    start,
-                    end: intersect,
-                });
-
-                if end == intersect {
-                    // the event is complete
-                    self.next_event = self.iter.next();
-                } else {
-                    // subslice the event
-                    self.next_event = Some(Source {
-                        start: intersect,
-                        end,
-                    });
-                };
-
-                if intersect == range.end {
-                    self.next_span = self.spans.next();
-                } else {
-                    self.next_span = Some((*span, intersect..range.end));
-                }
-
-                Some(event)
-            }
-            (Some(event), None) => {
-                self.next_event = self.iter.next();
-                Some(event)
-            }
-            // Can happen if cursor at EOF and/or diagnostic reaches past the end.
-            // We need to actually emit events for the cursor-at-EOF situation,
-            // even though the range is past the end of the text.  This needs to be
-            // handled appropriately by the drawing code by not assuming that
-            // all `Source` events point to valid indices in the rope.
-            (None, Some((span, range))) => {
-                let event = HighlightStart(Highlight(*span));
-                self.queue.push(HighlightEnd);
-                self.queue.push(Source {
-                    start: range.start,
-                    end: range.end,
-                });
-                self.next_span = self.spans.next();
-                Some(event)
-            }
-            (None, None) => None,
-            e => unreachable!("{:?}", e),
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -2079,7 +2288,7 @@ mod test {
         let textobject = TextObjectQuery { query };
         let mut cursor = QueryCursor::new();
 
-        let config = HighlightConfiguration::new(language, "", "", "").unwrap();
+        let config = HighlightConfiguration::new(language, "", "", "", "").unwrap();
         let syntax = Syntax::new(&source, Arc::new(config), Arc::new(loader));
 
         let root = syntax.tree().root_node();
@@ -2141,6 +2350,7 @@ mod test {
             language,
             &std::fs::read_to_string("../runtime/grammars/sources/rust/queries/highlights.scm")
                 .unwrap(),
+            "", // rainbows.scm
             &std::fs::read_to_string("../runtime/grammars/sources/rust/queries/injections.scm")
                 .unwrap(),
             "", // locals.scm

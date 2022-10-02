@@ -1204,7 +1204,11 @@ pub(super) fn goto_line_number(
 
     let line = args[0].parse::<usize>()?;
 
-    goto_line_impl(cx.editor, NonZeroUsize::new(line));
+    goto_line_impl(
+        cx.editor,
+        NonZeroUsize::new(line),
+        movement_from_mode(cx.editor.mode),
+    );
 
     let (view, doc) = current!(cx.editor);
 
